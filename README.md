@@ -1,50 +1,18 @@
 # 微调Whisper语音识别模型和加速推理
 
-简体中文 | [English](./README_en.md)
-
-![python version](https://img.shields.io/badge/python-3.8+-orange.svg)
-![GitHub forks](https://img.shields.io/github/forks/shuaijiang/Whisper-Finetune)
-![GitHub Repo stars](https://img.shields.io/github/stars/shuaijiang/Whisper-Finetune)
-![GitHub](https://img.shields.io/github/license/shuaijiang/Whisper-Finetune)
-[![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging_Face-BELLE--Whisper-blue.svg)](https://huggingface.co/BELLE-2)
-![支持系统](https://img.shields.io/badge/支持系统-Win/Linux/MAC-9cf)
-
 ## 前言
 
 OpenAI在开源了号称其英文语音辨识能力已达到人类水准的Whisper项目，且它亦支持其它98种语言的自动语音辨识。Whisper所提供的自动语音识与翻译任务，它们能将各种语言的语音变成文本，也能将这些文本翻译成英文。本项目主要的目的是为了对Whisper模型使用Lora进行微调，**支持无时间戳数据训练，有时间戳数据训练、无语音数据训练**。目前开源了好几个模型，具体可以在[openai](https://huggingface.co/openai)查看，下面列出了常用的几个模型。另外项目最后还支持CTranslate2加速推理和GGML加速推理，提示一下，加速推理支持直接使用Whisper原模型转换，并不一定需要微调。支持Windows桌面应用，Android应用和服务器部署。
 
-### 请先点 :star: 
-## 🔄 最新更新
-* [2025/03/26] 完善了加混响功能[Add reverb](https://github.com/shuaijiang/Whisper-Finetune/blob/master/docs/robust_asr.md#Add-reverb)，提升语音识别的鲁棒性。
-* [2024/12/16] 完善了ggml模型转换功能[convert-ggml](https://github.com/shuaijiang/Whisper-Finetune/tree/master/convert-ggml)，支持whisper.cpp。
-* [2024/11/18] 新增谱增强[SpecAugment](https://github.com/shuaijiang/Whisper-Finetune/blob/master/docs/robust_asr.md#SpecAugment)功能，有效提升语音识别的鲁棒性。
-* [2024/10/16] 发布[Belle-whisper-large-v3-turbo-zh](https://huggingface.co/BELLE-2/Belle-whisper-large-v3-turbo-zh)，基于whisper-large-v3-turbo提升中文识别能力（包括标点），中文识别能力显著提升（24-64%相对提升），识别速度7-8倍提升。
-* [2024/06/11] 发布[Belle-whisper-large-v3-zh-punct](https://huggingface.co/BELLE-2/Belle-whisper-large-v3-zh-punct)，基于Belle-whisper-large-v3提升中文标点能力，同时复杂场景识别能力进一步提升。
-* [2024/03/11] 发布[Belle-whisper-large-v3-zh](https://huggingface.co/BELLE-2/Belle-whisper-large-v3-zh)，基于whisper-large-v3提升中文识别能力，复杂场景识别能力显著提升。
-* [2023/12/29] 发布[Belle-whisper-large-v2-zh](https://huggingface.co/BELLE-2/Belle-whisper-large-v2-zh)，基于whisper-large-v2提升中文识别能力，中文识别能力显著提升。
-* [2023/12/29] 发布[Belle-distilwhisper-large-v2-zh](https://huggingface.co/BELLE-2/Belle-distilwhisper-large-v2-zh)，基于distilwhisper-large-v2提升中文识别能力，兼顾速度和精度。
- 
-## 支持模型
-
-- openai/whisper-large-v2
-- openai/whisper-large-v3
-- openai/whisper-large-v3-turbo
-- distil-whisper
-
-**使用环境：**
-
-- Anaconda 3
-- Python 3.10
-- Pytorch 2.1.0
-- GPU A100-PCIE-80GB
-
-
 ## 目录
  - [项目主要程序介绍](#项目主要程序介绍)
- - [模型说明](#模型说明)
  - [模型效果](#模型效果)
  - [安装环境](#安装环境)
  - [准备数据](#准备数据)
+ - [Web界面训练工具](#Web界面训练工具)
+   - [启动Web界面](#启动Web界面)
+   - [数据准备功能](#数据准备功能)
+   - [模型训练功能](#模型训练功能)
  - [微调模型](#微调模型)
    - [单卡训练](#单卡训练)
    - [多卡训练](#多卡训练)
@@ -65,51 +33,16 @@ OpenAI在开源了号称其英文语音辨识能力已达到人类水准的Whisp
 1. `aishell.py`：制作AIShell训练数据。
 2. `finetune.py`：PEFT方式微调模型。
 3. `finetune_all.py`：全参数微调模型。
-4. `merge_lora.py`：合并Whisper和Lora的模型。
-5. `evaluation.py`：评估使用微调后的模型或者Whisper原模型。
-6. `infer_tfs.py`：使用transformers直接调用微调后的模型或者Whisper原模型预测，只适合推理短音频。
-7. `infer_ct2.py`：使用转换为CTranslate2的模型预测，主要参考这个程序用法。
-8. `infer_gui.py`：有GUI界面操作，使用转换为CTranslate2的模型预测。
-9. `infer_server.py`：使用转换为CTranslate2的模型部署到服务器端，提供给客户端调用。
-10. `convert-ggml.py`：转换模型为GGML格式模型，给Android应用或者Windows应用使用。
-11. `AndroidDemo`：该目录存放的是部署模型到Android的源码。
-12. `WhisperDesktop`：该目录存放的是Windows桌面应用的程序。
-
-
-<a name='模型说明'></a>
-## 模型说明
-|       Model      | Parameters(M) |Base Model|  Data (Re)Sample Rate   |                      Train Datasets         | Fine-tuning (full or peft) | 
-|:----------------:|:-------:|:-------:|:-------:|:----------------------------------------------------------:|:-----------:|
-| Belle-whisper-large-v2-zh | 1550 |whisper-large-v2| 16KHz | [AISHELL-1](https://openslr.magicdatatech.com/resources/33/) [AISHELL-2](https://www.aishelltech.com/aishell_2) [WenetSpeech](https://wenet.org.cn/WenetSpeech/) [HKUST](https://catalog.ldc.upenn.edu/LDC2005S15)  |   full fine-tuning   |    
-| Belle-distil-whisper-large-v2-zh | 756 | distil-whisper-large-v2 | 16KHz | [AISHELL-1](https://openslr.magicdatatech.com/resources/33/) [AISHELL-2](https://www.aishelltech.com/aishell_2) [WenetSpeech](https://wenet.org.cn/WenetSpeech/) [HKUST](https://catalog.ldc.upenn.edu/LDC2005S15)  |   full fine-tuning    |    
-| Belle-whisper-large-v3-zh | 1550 |whisper-large-v3 | 16KHz | [AISHELL-1](https://openslr.magicdatatech.com/resources/33/) [AISHELL-2](https://www.aishelltech.com/aishell_2) [WenetSpeech](https://wenet.org.cn/WenetSpeech/) [HKUST](https://catalog.ldc.upenn.edu/LDC2005S15)  |   full fine-tuning   |    
-| Belle-whisper-large-v3-zh-punct | 1550 | Belle-whisper-large-v3-zh | 16KHz | [AISHELL-1](https://openslr.magicdatatech.com/resources/33/) [AISHELL-2](https://www.aishelltech.com/aishell_2) [WenetSpeech](https://wenet.org.cn/WenetSpeech/) [HKUST](https://catalog.ldc.upenn.edu/LDC2005S15)  |   lora fine-tuning   |  
-| Belle-whisper-large-v3-turbo-zh | 809 | Belle-whisper-large-v3-turbo | 16KHz | [AISHELL-1](https://openslr.magicdatatech.com/resources/33/) [AISHELL-2](https://www.aishelltech.com/aishell_2) [WenetSpeech](https://wenet.org.cn/WenetSpeech/) [HKUST](https://catalog.ldc.upenn.edu/LDC2005S15)  |   full fine-tuning   |   
-<a name='模型效果'></a>
-
-## 模型效果 CER(%) ↓
-|      Model       |  Language Tag   | aishell_1 test |aishell_2 test| wenetspeech test_net | wenetspeech test_meeting | HKUST_dev| Model Link |
-|:----------------:|:-------:|:-----------:|:-----------:|:--------:|:-----------:|:-------:|:-------:|
-| whisper-large-v3-turbo | Chinese |   8.639    | 6.014 |   13.507   | 20.313 | 37.324 |[HF](https://huggingface.co/openai/whisper-large-v3-turbo) |
-| Belle-whisper-large-v3-turbo-zh | Chinese |   3.070    | 4.114 |   10.230   | 13.357 | 18.944 |[HF](https://huggingface.co/BELLE-2/Belle-whisper-large-v3-turbo-zh) |
-| whisper-large-v2 | Chinese |   8.818   | 6.183  |   12.343  |  26.413  | 31.917 | [HF](https://huggingface.co/openai/whisper-large-v2)|
-| Belle-whisper-large-v2-zh | Chinese |   **2.549**    | **3.746**  |   **8.503**   | 14.598 | **16.289** |[HF](https://huggingface.co/BELLE-2/Belle-whisper-large-v2-zh) |
-| whisper-large-v3 | Chinese |   8.085   | 5.475  |   11.72  |  20.15  | 28.597 | [HF](https://huggingface.co/openai/whisper-large-v3)|
-| Belle-whisper-large-v3-zh | Chinese |   2.781    | 3.786 |   8.865   | 11.246 | 16.440 |[HF](https://huggingface.co/BELLE-2/Belle-whisper-large-v3-zh) |
-| Belle-whisper-large-v3-zh-punct | Chinese |   2.945    | 3.808 |   8.998   | **10.973** | 17.196 |[HF](https://huggingface.co/BELLE-2/Belle-whisper-large-v3-zh-punct) |
-| distil-whisper-large-v2 | Chinese |  -    | -  |   -  | - | -|[HF](https://huggingface.co/distil-whisper/distil-large-v2) |
-| Belle-distilwhisper-large-v2-zh | Chinese |  5.958   | 6.477  |   12.786    | 17.039 | 20.771 | [HF](https://huggingface.co/BELLE-2/Belle-distilwhisper-large-v2-zh) |
-
-
-
-**重要说明：**
-1. 在评估的时候移除模型输出的标点符号，并把繁体中文转成简体中文。
-2. `aishell_1_test`为AIShell-1的测试集，`aishell_2_test`为AIShell-2的测试集，`test_net`和`test_meeting`为WenetSpeech的测试集。
-3. distil-whisper-large-v2基于英文数据蒸馏，只能输出英文。 It's important to note that the original distil-whisper-large-v2 cannot transcribe Chinese (it only outputs English).
-4. Belle-whisper-large-v3-zh 相比Belle-whisper-large-v2-zh，在复杂场景有明显优势，在wenetspeech meeting上取得更好效果，有22%的相对提升。
-5. Belle-whisper-large-v3-zh-punct 具备标点符号能力，标点符号来自[punc_ct-transformer_cn-en-common-vocab471067-large](https://www.modelscope.cn/models/iic/punc_ct-transformer_cn-en-common-vocab471067-large/)。此外，复杂场景效果进一步提升。
-6. Belle-whisper-large-v3-turbo-zh 相比whisper-large-v3-turbo有24-64%的相对提升，相比Belle-whisper-large-v3-zh-punct有轻微的精度下降，但是有7-8倍的速度提升，在受限算力下有显著应用价值。
-<a name='安装环境'></a>
+4. `train_webui.py`：**Web界面训练工具**，提供可视化的数据准备和模型训练界面，支持LoRA微调和全参数微调。
+5. `merge_lora.py`：合并Whisper和Lora的模型。
+6. `evaluation.py`：评估使用微调后的模型或者Whisper原模型。
+7. `infer_tfs.py`：使用transformers直接调用微调后的模型或者Whisper原模型预测，只适合推理短音频。
+8. `infer_ct2.py`：使用转换为CTranslate2的模型预测，主要参考这个程序用法。
+9. `infer_gui.py`：有GUI界面操作，使用转换为CTranslate2的模型预测。
+10. `infer_server.py`：使用转换为CTranslate2的模型部署到服务器端，提供给客户端调用。
+11. `convert-ggml.py`：转换模型为GGML格式模型，给Android应用或者Windows应用使用。
+12. `AndroidDemo`：该目录存放的是部署模型到Android的源码。
+13. `WhisperDesktop`：该目录存放的是Windows桌面应用的程序。
 
 ## 安装环境
 
@@ -176,19 +109,149 @@ python -m pip install https://github.com/jllllll/bitsandbytes-windows-webui/rele
 }
 ```
 
+<a name='Web界面训练工具'></a>
+
+## Web界面训练工具
+
+`train_webui.py` 是一个基于Gradio的Web界面训练工具，为用户提供了可视化的数据准备和模型训练界面。相比命令行方式，Web界面更加直观易用，特别适合初学者和需要频繁调整参数的用户。
+
+### 主要功能特点
+
+- **可视化数据准备**：支持音频文件上传、数据集格式转换、数据预览等功能
+- **智能数据划分**：自动随机划分训练集和测试集，支持自定义划分比例
+- **双模式训练**：支持LoRA微调和全参数微调两种训练模式
+- **实时训练监控**：提供训练进度显示、日志输出、训练曲线等实时监控功能
+- **脚本自动生成**：可以将训练配置自动生成为shell脚本，方便后续批量训练
+- **参数预设管理**：支持保存和加载常用的训练参数配置
+
+<a name='启动Web界面'></a>
+
+### 启动Web界面
+
+使用以下命令启动Web界面：
+
+```shell
+python train_webui.py
+```
+
+启动后，在浏览器中访问显示的本地地址（通常是 `http://127.0.0.1:7860`）即可使用Web界面。
+
+<a name='数据准备功能'></a>
+
+### 数据准备功能
+
+Web界面的数据准备模块提供以下功能：
+
+1. **数据集上传**：支持批量上传音频文件和对应的标注文件
+2. **格式转换**：自动将不同格式的数据转换为训练所需的jsonlines格式
+3. **数据预览**：可以预览数据集内容，检查数据质量
+4. **随机划分**：自动将数据集随机划分为训练集和测试集
+   - 支持自定义训练集比例（默认90%）
+   - 确保数据划分的随机性和均匀性
+5. **数据统计**：显示数据集的基本统计信息，如总时长、样本数量等
+
+<a name='模型训练功能'></a>
+
+### 模型训练功能
+
+Web界面的模型训练模块支持以下功能：
+
+#### 训练模式选择
+
+- **LoRA微调模式**：
+  - 使用 `finetune.py` 脚本进行训练
+  - 支持AdaLoRA自适应参数分配
+  - 显存占用少，训练速度快
+  - 生成的脚本文件以 `train_lora_` 开头
+
+- **全参数微调模式**：
+  - 使用 `finetune_all.py` 脚本进行训练
+  - 支持编码器冻结选项
+  - 训练效果更好，无需后续合并步骤
+  - 生成的脚本文件以 `train_full_` 开头
+
+#### 参数配置
+
+界面提供了丰富的训练参数配置选项：
+
+- **基础设置**：基础模型选择、输出目录、GPU设置等
+- **训练参数**：学习率、批次大小、训练轮数、梯度累积等
+- **优化选项**：FP16训练、8-bit量化、梯度检查点等
+- **LoRA参数**：LoRA rank、alpha值、dropout等（仅LoRA模式）
+- **冻结选项**：编码器冻结设置（仅全参数模式）
+
+#### 训练监控
+
+- **实时日志**：显示训练过程中的详细日志信息
+- **进度跟踪**：显示当前训练进度和预计完成时间
+- **命令预览**：实时显示生成的训练命令，方便调试
+- **脚本下载**：支持将训练配置保存为shell脚本文件
+
+#### 脚本生成功能
+
+训练界面支持将当前配置的训练参数自动生成为可执行的shell脚本：
+
+- **智能命名**：根据训练模式自动生成脚本文件名
+  - LoRA微调：`train_lora_YYYYMMDD_HHMMSS.sh`
+  - 全参数微调：`train_full_YYYYMMDD_HHMMSS.sh`
+- **完整配置**：脚本包含所有训练参数和环境设置
+- **使用说明**：脚本中包含详细的使用说明和注意事项
+- **跨平台兼容**：支持Windows和Linux系统
+
+生成的脚本可以直接在命令行中执行，方便进行批量训练或在服务器上运行。
+
 <a name='微调模型'></a>
 
 ## 微调模型
 
-准备好数据之后，就可以开始微调模型了。训练最重要的两个参数分别是，`--base_model`指定微调的Whisper模型，这个参数值需要在[HuggingFace](https://huggingface.co/openai)存在的，这个不需要提前下载，启动训练时可以自动下载，当然也可以提前下载，那么`--base_model`指定就是路径，同时`--local_files_only`设置为True。第二个`--output_path`是是训练时保存的Lora检查点路径，因为我们使用Lora来微调模型。如果想存足够的话，最好将`--use_8bit`设置为False，这样训练速度快很多。其他更多的参数请查看这个程序。
+准备好数据之后，就可以开始微调模型了。本项目支持两种微调方式：
+
+1. **LoRA微调（推荐）**：使用参数高效微调技术，显存占用少，训练速度快
+2. **全参数微调**：微调模型的所有参数，效果更好但需要更多显存
+
+### 训练模式选择
+
+**LoRA微调**（使用 `finetune.py`）：
+- 适合显存有限的情况
+- 训练速度快，显存占用少
+- 支持AdaLoRA自适应参数分配
+- 需要后续合并模型步骤
+
+**全参数微调**（使用 `finetune_all.py`）：
+- 适合显存充足的情况
+- 微调效果更好，无需合并模型
+- 支持编码器冻结选项（`--freeze_encoder`）
+- 直接输出完整的微调模型
+
+### 重要参数说明
+
+训练最重要的参数包括：
+- `--base_model`：指定微调的Whisper模型，需要在[HuggingFace](https://huggingface.co/openai)存在
+- `--output_dir`：训练时保存模型的路径
+- `--freeze_encoder`：（仅全参数微调）是否冻结编码器，只微调解码器
+- `--use_8bit`：是否使用8位量化，设置为False可以提高训练速度
+
+如果显存足够的话，建议将`--use_8bit`设置为False，这样训练速度会快很多。
 
 <a name='单卡训练'></a>
 
 ### 单卡训练
 
 单卡训练命令如下，Windows系统可以不添加`CUDA_VISIBLE_DEVICES`参数。
+
+**LoRA微调：**
 ```shell
 CUDA_VISIBLE_DEVICES=0 python finetune.py --base_model=openai/whisper-tiny --output_dir=output/
+```
+
+**全参数微调：**
+```shell
+CUDA_VISIBLE_DEVICES=0 python finetune_all.py --base_model=openai/whisper-tiny --output_dir=output/
+```
+
+**全参数微调（冻结编码器）：**
+```shell
+CUDA_VISIBLE_DEVICES=0 python finetune_all.py --base_model=openai/whisper-tiny --output_dir=output/ --freeze_encoder
 ```
 
 <a name='多卡训练'></a>
@@ -198,8 +261,20 @@ CUDA_VISIBLE_DEVICES=0 python finetune.py --base_model=openai/whisper-tiny --out
 多卡训练有两种方法，分别是torchrun和accelerate，开发者可以根据自己的习惯使用对应的方式。
 
 1. 使用torchrun启动多卡训练，命令如下，通过`--nproc_per_node`指定使用的显卡数量。
+
+**LoRA微调：**
 ```shell
 torchrun --nproc_per_node=2 finetune.py --base_model=openai/whisper-tiny --output_dir=output/
+```
+
+**全参数微调：**
+```shell
+torchrun --nproc_per_node=2 finetune_all.py --base_model=openai/whisper-tiny --output_dir=output/
+```
+
+**全参数微调（冻结编码器）：**
+```shell
+torchrun --nproc_per_node=2 finetune_all.py --base_model=openai/whisper-tiny --output_dir=output/ --freeze_encoder
 ```
 
 2. 使用accelerate启动多卡训练，如果是第一次使用accelerate，要配置训练参数，方式如下。
@@ -233,8 +308,20 @@ accelerate env
 ```
 
 开始训练命令如下。
+
+**LoRA微调：**
 ```shell
 accelerate launch finetune.py --base_model=openai/whisper-tiny --output_dir=output/
+```
+
+**全参数微调：**
+```shell
+accelerate launch finetune_all.py --base_model=openai/whisper-tiny --output_dir=output/
+```
+
+**全参数微调（冻结编码器）：**
+```shell
+accelerate launch finetune_all.py --base_model=openai/whisper-tiny --output_dir=output/ --freeze_encoder
 ```
 
 
@@ -251,7 +338,11 @@ accelerate launch finetune.py --base_model=openai/whisper-tiny --output_dir=outp
 
 ## 合并模型
 
-PEFT方式微调模型完成之后会有两个模型，第一个是Whisper基础模型，第二个是Lora模型，需要把这两个模型合并之后才能之后的操作。这个程序只需要传递两个参数，`--lora_model`指定的是训练结束后保存的Lora模型路径，其实就是检查点文件夹路径，第二个`--output_dir`是合并后模型的保存目录。
+**注意：** 只有LoRA微调需要合并模型，全参数微调直接输出完整模型，无需此步骤。
+
+PEFT方式（LoRA）微调模型完成之后会有两个模型，第一个是Whisper基础模型，第二个是Lora模型，需要把这两个模型合并之后才能进行后续操作。这个程序只需要传递两个参数，`--lora_model`指定的是训练结束后保存的Lora模型路径，其实就是检查点文件夹路径，第二个`--output_dir`是合并后模型的保存目录。
+
+**LoRA模型合并：**
 ```shell
 python merge_lora.py --lora_model=output/whisper-tiny/checkpoint-best/ --output_dir=models/
 ```
