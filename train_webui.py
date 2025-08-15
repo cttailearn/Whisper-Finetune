@@ -617,9 +617,12 @@ def build_command(args, gpus):
             "--master_port=29500"
         ])
     
-    # 主脚本 - 确保使用完整路径
+    # 根据训练模式选择脚本
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    finetune_script = os.path.join(current_dir, "finetune.py")
+    if args['training_mode'] == "LoRA微调":
+        finetune_script = os.path.join(current_dir, "finetune.py")
+    else:  # 全参数微调
+        finetune_script = os.path.join(current_dir, "finetune_all.py")
     
     # 确保脚本存在
     if not os.path.exists(finetune_script):
@@ -630,8 +633,9 @@ def build_command(args, gpus):
         # 多卡训练：直接添加脚本路径
         list_command.append(finetune_script)
     else:
-        # 单卡训练：指定特定的Python解释器路径
-        python_exec = "/root/miniconda3/envs/whisper/bin/python"
+        # 单卡训练：使用当前Python解释器
+        import sys
+        python_exec = sys.executable
         list_command.extend([python_exec, finetune_script])
     
     # 数据参数
@@ -651,10 +655,15 @@ def build_command(args, gpus):
         f"--language={args['language']}",
         f"--task={args['task']}",
         f"--timestamps={'True' if args['timestamps'] else 'False'}",
-        f"--use_adalora={'True' if args['use_adalora'] else 'False'}",
         f"--fp16={'True' if args['fp16'] else 'False'}",
         f"--use_8bit={'True' if args['use_8bit'] else 'False'}",
     ])
+    
+    # 根据训练模式添加特定参数
+    if args['training_mode'] == "LoRA微调":
+        list_command.append(f"--use_adalora={'True' if args['use_adalora'] else 'False'}")
+    else:  # 全参数微调
+        list_command.append(f"--freeze_encoder={'True' if args['freeze_encoder'] else 'False'}")
     
     # 训练参数
     list_command.extend([
@@ -760,26 +769,47 @@ def run_training(list_command, output_file, log_callback=None):
         TRAINING_PROCESS = None
         TRAINING_ACTIVE = False
 
-def save_command_script(command_str, output_dir):
+def save_command_script(command_str, output_dir, training_mode="LoRA微调"):
     """将训练命令保存为shell脚本文件"""
     try:
         # 确保输出目录存在
         os.makedirs(output_dir, exist_ok=True)
         
-        # 生成文件名
+        # 根据训练模式生成不同的文件名
         timestamp = time.strftime("%Y%m%d-%H%M%S")
-        script_filename = f"train_command_{timestamp}.sh"
+        if training_mode == "LoRA微调":
+            script_filename = f"train_lora_{timestamp}.sh"
+            script_type = "LoRA微调"
+        else:
+            script_filename = f"train_full_{timestamp}.sh"
+            script_type = "全参数微调"
+        
         script_path = os.path.join(output_dir, script_filename)
         
         # 写入文件
-        with open(script_path, "w") as f:
+        with open(script_path, "w", encoding="utf-8") as f:
             f.write("#!/bin/bash\n")
-            f.write("# Whisper训练命令脚本\n")
-            f.write(f"# 生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write(f"# Whisper {script_type}训练命令脚本\n")
+            f.write(f"# 生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"# 训练模式: {training_mode}\n\n")
+            
+            # 添加使用说明
+            f.write("# 使用说明:\n")
+            if training_mode == "LoRA微调":
+                f.write("# 此脚本用于LoRA微调训练，参数效率高，显存占用少\n")
+                f.write("# 训练完成后需要使用模型合并功能将LoRA适配器合并到基础模型\n")
+            else:
+                f.write("# 此脚本用于全参数微调训练，效果更好但显存占用大\n")
+                f.write("# 训练完成后直接得到完整的微调模型，无需额外合并步骤\n")
+            f.write("# 执行前请确保已安装所需依赖和配置好环境\n\n")
+            
             f.write(command_str + "\n")
         
-        # 添加执行权限
-        os.chmod(script_path, 0o755)
+        # 添加执行权限（Windows下可能不支持，但不会报错）
+        try:
+            os.chmod(script_path, 0o755)
+        except:
+            pass  # Windows下忽略权限设置错误
         
         return script_path
     except Exception as e:
@@ -795,8 +825,10 @@ def start_training(
     base_model,
     language,
     task,
+    training_mode,
     timestamps,
     use_adalora,
+    freeze_encoder,
     fp16,
     use_8bit,
     output_dir,
@@ -835,8 +867,10 @@ def start_training(
         "base_model": base_model,
         "language": language,
         "task": task,
+        "training_mode": training_mode,
         "timestamps": timestamps,
         "use_adalora": use_adalora,
+        "freeze_encoder": freeze_encoder,
         "fp16": fp16,
         "use_8bit": use_8bit,
         "output_dir": output_dir,
@@ -868,7 +902,7 @@ def start_training(
     # 保存训练命令为脚本（如果用户选择）
     script_path = None
     if save_command_script_flag:
-        script_path = save_command_script(str_command, output_dir)
+        script_path = save_command_script(str_command, output_dir, training_mode)
         script_info = f"\n\n📜 训练命令已保存为脚本: {script_path}" if script_path else "\n\n⚠️ 保存训练脚本失败"
     else:
         script_info = ""
@@ -1102,6 +1136,19 @@ def update_model_interface(model_type):
             gr.Dropdown(label="选择在线模型", visible=False),  # model_choice
             gr.Textbox(label="本地模型路径", visible=True),  # custom_model_path
             gr.Textbox(label="模型下载路径 (仅在线模型)", visible=False)  # download_root_input
+        )
+
+def update_training_mode_interface(training_mode):
+    """根据训练模式更新界面显示"""
+    if training_mode == "LoRA微调":
+        return (
+            gr.Checkbox(label="使用AdaLora", visible=True),  # use_adalora
+            gr.Checkbox(label="冻结编码器", visible=False)   # freeze_encoder
+        )
+    else:  # 全参数微调
+        return (
+            gr.Checkbox(label="使用AdaLora", visible=False), # use_adalora
+            gr.Checkbox(label="冻结编码器", visible=True)    # freeze_encoder
         )
 
 def save_dataset_entry(text, audio_path, output_dir):
@@ -1345,9 +1392,28 @@ with gr.Blocks(theme=gr.themes.Ocean(), title="Whisper 训练工具套件") as d
                 base_model = gr.Textbox(label="基础模型", value="./whisper-large-v3-turbo")
                 language = gr.Dropdown(label="语言", choices=["Chinese", "English", "Japanese", "Multilingual"], value="Chinese")
                 task = gr.Dropdown(label="任务", choices=["transcribe", "translate"], value="transcribe")
+                
+                # 训练模式选择
+                training_mode = gr.Radio(
+                    label="训练模式",
+                    choices=["LoRA微调", "全参数微调"],
+                    value="LoRA微调",
+                    info="LoRA微调：参数效率高，显存占用少；全参数微调：效果更好，显存占用大"
+                )
+                
                 with gr.Row():
                     timestamps = gr.Checkbox(label="使用时间戳", value=False)
-                    use_adalora = gr.Checkbox(label="使用AdaLora", value=True)
+                    # LoRA相关参数，仅在LoRA模式下显示
+                    use_adalora = gr.Checkbox(label="使用AdaLora", value=True, visible=True)
+                
+                # 全参数微调专用参数
+                freeze_encoder = gr.Checkbox(
+                    label="冻结编码器", 
+                    value=True, 
+                    visible=False,
+                    info="仅训练解码器参数，减少显存占用"
+                )
+                
                 with gr.Row():
                     fp16 = gr.Checkbox(label="FP16训练", value=True)
                     use_8bit = gr.Checkbox(label="8-bit量化", value=False)
@@ -1401,16 +1467,23 @@ with gr.Blocks(theme=gr.themes.Ocean(), title="Whisper 训练工具套件") as d
               interactive=False,
               visible=False)
         
+        # 设置训练模式切换事件
+        training_mode.change(
+            fn=update_training_mode_interface,
+            inputs=[training_mode],
+            outputs=[use_adalora, freeze_encoder]
+        )
+        
         # 存储所有输入组件
         all_input_components = [
             train_data, test_data, augment_config_path, min_audio_len, max_audio_len,
-            base_model, language, task, timestamps, use_adalora, fp16, use_8bit,
+            base_model, language, task, training_mode, timestamps, use_adalora, freeze_encoder, fp16, use_8bit,
             output_dir, num_train_epochs, learning_rate, warmup_steps,
             per_device_train_batch_size, per_device_eval_batch_size,
             gradient_accumulation_steps, logging_steps, eval_steps, save_steps,
             num_workers, save_total_limit,
             resume_from_checkpoint, local_files_only, use_compile, push_to_hub, hub_model_id,
-            gpus,save_command_script_flag
+            gpus, save_command_script_flag
         ]
         
         # 设置开始按钮的点击事件
