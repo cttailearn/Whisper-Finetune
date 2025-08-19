@@ -30,7 +30,8 @@ add_arg("min_audio_len",     type=float, default=0.5,  help="最小的音频长�
 add_arg("max_audio_len",     type=float, default=30,   help="最大的音频长度，单位秒")
 add_arg("local_files_only",  type=bool,  default=True, help="是否只在本地加载模型，不尝试下载")
 add_arg("task",       type=str, default="transcribe", choices=['transcribe', 'translate'], help="模型的任务")
-add_arg("metric",     type=str, default="cer",        choices=['cer', 'wer'],              help="评估方式")
+add_arg("max_samples",  type=int, default=None,      help="从测试集中使用的最大样本数量，None表示使用全部数据")
+add_arg("metric",     type=str, default="both",       choices=['cer', 'wer', 'both'],      help="评估方式，both表示同时计算CER和WER")
 args = parser.parse_args()
 print_arguments(args)
 
@@ -64,13 +65,40 @@ eval_dataloader = DataLoader(test_dataset, batch_size=args.batch_size,
                              num_workers=args.num_workers, collate_fn=data_collator)
 
 # 获取评估方法
-metric = evaluate.load(f'metrics/{args.metric}.py')
+if args.metric == 'both':
+    cer_metric = evaluate.load(f'metrics/cer.py')
+    wer_metric = evaluate.load(f'metrics/wer.py')
+    cer_has_data = False
+    wer_has_data = False
+else:
+    metric = evaluate.load(f'metrics/{args.metric}.py')
+    metric_has_data = False
 
 OUT = open(args.out_data, 'w', encoding='utf-8')
 
 # 开始评估
-for step, batch in enumerate(tqdm(eval_dataloader)):
-    with torch.cuda.amp.autocast():
+processed_samples = 0
+total_batches = len(eval_dataloader)
+if args.max_samples is not None:
+    # 估算需要处理的批次数量
+    estimated_batches = min(total_batches, (args.max_samples // args.batch_size) + 1)
+    print(f"预计需要处理 {estimated_batches} 个批次以达到 {args.max_samples} 个样本")
+
+for step, batch in enumerate(tqdm(eval_dataloader, desc="评估进度")):
+    # 检查是否达到最大样本数量限制
+    if args.max_samples is not None and processed_samples >= args.max_samples:
+        print(f"已达到最大样本数量限制 {args.max_samples}，停止处理")
+        break
+    
+    # 检查batch是否为空或无效
+    if not batch['id'] or len(batch['id']) == 0:
+        continue
+    
+    # 检查input_features是否有效
+    if batch["input_features"].size(0) == 0:
+        continue
+        
+    with torch.amp.autocast('cuda'):
         with torch.no_grad():
             generated_tokens = (
                 model.generate(
@@ -95,14 +123,64 @@ for step, batch in enumerate(tqdm(eval_dataloader)):
             if args.language == 'en':
                 decoded_preds = to_lower(decoded_preds)
                 decoded_labels = to_lower(decoded_labels)
-            for audio_id, pred_text in zip(batch['id'], decoded_preds):
-                OUT.write('{}\t{}\n'.format(audio_id, pred_text))
             
-            metric.add_batch(predictions=decoded_preds, references=decoded_labels)
+            # 过滤空参考样本，同时考虑max_samples限制
+            filtered_preds = []
+            filtered_labels = []
+            filtered_ids = []
+            for i, (audio_id, pred_text, label_text) in enumerate(zip(batch['id'], decoded_preds, decoded_labels)):
+                # 检查是否已达到样本数量限制
+                if args.max_samples is not None and processed_samples >= args.max_samples:
+                    break
+                    
+                # 过滤掉空的或只包含空白字符的参考文本
+                if label_text.strip():
+                    filtered_preds.append(pred_text)
+                    filtered_labels.append(label_text)
+                    filtered_ids.append(audio_id)
+                    OUT.write('{}	{}\n'.format(audio_id, pred_text))
+                    processed_samples += 1
+            
+            # 如果达到限制，提前退出
+            if args.max_samples is not None and processed_samples >= args.max_samples:
+                print(f"已处理 {processed_samples} 个样本，达到限制，提前结束")
+                break
+            
+            # 添加到评估指标
+            if filtered_preds:  # 只有在有有效样本时才添加
+                if args.metric == 'both':
+                    cer_metric.add_batch(predictions=filtered_preds, references=filtered_labels)
+                    wer_metric.add_batch(predictions=filtered_preds, references=filtered_labels)
+                    cer_has_data = True
+                    wer_has_data = True
+                else:
+                    metric.add_batch(predictions=filtered_preds, references=filtered_labels)
+                    metric_has_data = True
+    
     # 删除计算的记录
     del generated_tokens, labels, batch
-    gc.collect()
+    if step % 10 == 0:  # 每10个批次清理一次内存
+        gc.collect()
+    
+    # 如果已达到样本限制，退出循环
+    if args.max_samples is not None and processed_samples >= args.max_samples:
+        break
 OUT.close()
 # 计算评估结果
-m = metric.compute()
-print(f"评估结果：{args.metric}={round(m, 5)}")
+if processed_samples > 0:
+    if args.metric == 'both':
+        if cer_has_data and wer_has_data:
+            cer_result = cer_metric.compute()
+            wer_result = wer_metric.compute()
+            print(f"评估结果：CER={round(cer_result, 5)}, WER={round(wer_result, 5)}")
+        else:
+            print("警告：评估指标中没有足够的数据进行计算")
+    else:
+        if metric_has_data:
+            m = metric.compute()
+            print(f"评估结果：{args.metric}={round(m, 5)}")
+        else:
+            print("警告：评估指标中没有足够的数据进行计算")
+else:
+    print("警告：没有有效样本被处理，无法计算评估结果")
+print(f"实际处理的样本数量：{processed_samples}")
