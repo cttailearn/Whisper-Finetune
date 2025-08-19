@@ -208,7 +208,12 @@ class CustomDataset(Dataset):
             return data
         except Exception as e:
             print(f'读取数据出错，序号：{idx}，错误信息：{e}', file=sys.stderr)
-            return self.__getitem__(random.randint(0, self.__len__() - 1))
+            # 返回一个空的数据结构，让DataCollator处理
+            return {
+                'input_features': None,
+                'labels': None,
+                'id': f'error_{idx}'
+            }
 
     def __len__(self):
         return len(self.data_list)
