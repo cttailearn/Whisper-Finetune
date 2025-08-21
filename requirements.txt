@@ -19,4 +19,5 @@ fastapi>=0.95.1
 starlette>=0.26.1
 tensorboardX>=2.2
 gradio>=3.50.0
+faster-whisper
 
