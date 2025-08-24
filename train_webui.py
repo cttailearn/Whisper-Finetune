@@ -31,6 +31,41 @@ import shutil
 import psutil  # 新增用于磁盘空间检查
 import signal
 
+# Faster Whisper 相关导入
+try:
+    from faster_whisper import WhisperModel as FasterWhisperModel
+    FASTER_WHISPER_AVAILABLE = True
+except ImportError:
+    FASTER_WHISPER_AVAILABLE = False
+    print("Warning: faster-whisper not available. Install with: pip install faster-whisper")
+
+# VAD 相关导入
+try:
+    import webrtcvad
+    VAD_AVAILABLE = True
+except ImportError:
+    VAD_AVAILABLE = False
+    print("Warning: webrtcvad not available. Install with: pip install webrtcvad")
+
+# Silero VAD 检查（延迟加载，不在启动时验证）
+SILERO_VAD_AVAILABLE = False
+try:
+    import torch
+    # 只检查基础依赖，不在启动时加载模型
+    SILERO_VAD_AVAILABLE = True
+    print("PyTorch可用，Silero VAD功能已启用（将在首次使用时加载模型）")
+except ImportError:
+    print("Warning: PyTorch不可用，无法使用Silero VAD")
+    SILERO_VAD_AVAILABLE = False
+
+# CT2 转换器导入
+try:
+    import ct2_transformers_converter
+    CT2_CONVERTER_AVAILABLE = True
+except ImportError:
+    CT2_CONVERTER_AVAILABLE = False
+    print("Warning: ct2-transformers-converter not available. Install with: pip install ct2-transformers-converter")
+
 # 设置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -46,11 +81,302 @@ os.environ['GRADIO_CACHE_DIR'] = os.path.join(temp_dir, 'gradio_cache')
 # 模型缓存字典，避免重复加载模型
 model_cache = {}
 
+# Silero VAD 模型缓存
+silero_vad_model = None
+silero_vad_utils = None
+
 # 训练状态
 TRAINING_PROCESS = None
 TRAINING_THREAD = None
 OUTPUT_FILE = None
 TRAINING_ACTIVE = False
+
+# ============================== VAD 语音活动检测功能 ==============================
+def apply_vad_filter(audio_path, vad_method="silero", aggressiveness=3):
+    """应用VAD过滤去除静音片段"""
+    try:
+        import librosa
+        
+        # 读取音频文件
+        audio, sr = librosa.load(audio_path, sr=16000)
+        
+        if vad_method == "webrtc" and VAD_AVAILABLE:
+            print("使用WebRTC VAD进行语音活动检测...")
+            filtered_audio_path = apply_webrtc_vad(audio, sr, aggressiveness)
+            if filtered_audio_path:
+                print("WebRTC VAD过滤完成")
+                return filtered_audio_path
+            else:
+                print("WebRTC VAD过滤失败，使用原始音频")
+                return audio_path
+        elif vad_method == "silero" and SILERO_VAD_AVAILABLE:
+            print("使用Silero VAD进行语音活动检测...")
+            filtered_audio_path = apply_silero_vad(audio, sr)
+            if filtered_audio_path:
+                print("Silero VAD过滤完成")
+                return filtered_audio_path
+            else:
+                print("Silero VAD过滤失败，使用原始音频")
+                return audio_path
+        else:
+            # 如果VAD不可用，返回原始音频
+            if vad_method == "silero":
+                if not SILERO_VAD_AVAILABLE:
+                    print("VAD方法 silero 不可用：PyTorch未安装或不可用")
+                    print("建议：pip install torch 或使用 webrtc VAD 作为替代")
+                else:
+                    print("VAD方法 silero 暂时不可用，可能是网络问题")
+            elif vad_method == "webrtc":
+                print("VAD方法 webrtc 不可用：webrtcvad包未安装")
+                print("建议：pip install webrtcvad")
+            else:
+                print(f"未知的VAD方法: {vad_method}")
+            
+            print("VAD过滤未生效，使用原始音频")
+            return audio_path
+            
+    except Exception as e:
+        print(f"VAD过滤失败: {e}")
+        print("使用原始音频")
+        return audio_path
+
+def apply_webrtc_vad(audio, sr, aggressiveness=3):
+    """使用WebRTC VAD进行语音活动检测"""
+    try:
+        import webrtcvad
+        import struct
+        
+        vad = webrtcvad.Vad(aggressiveness)
+        
+        # 转换为16位PCM格式
+        audio_int16 = (audio * 32767).astype(np.int16)
+        
+        # WebRTC VAD需要特定的帧长度（10ms, 20ms, 30ms）
+        frame_duration = 30  # ms
+        frame_length = int(sr * frame_duration / 1000)
+        
+        voiced_frames = []
+        for i in range(0, len(audio_int16) - frame_length, frame_length):
+            frame = audio_int16[i:i + frame_length]
+            frame_bytes = struct.pack(f'{len(frame)}h', *frame)
+            
+            if vad.is_speech(frame_bytes, sr):
+                voiced_frames.extend(frame)
+        
+        if voiced_frames:
+            # 保存过滤后的音频
+            filtered_audio = np.array(voiced_frames, dtype=np.int16) / 32767.0
+            
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=temp_dir) as tmpfile:
+                output_path = tmpfile.name
+            
+            import soundfile as sf
+            sf.write(output_path, filtered_audio, sr)
+            return output_path
+        else:
+            print("WebRTC VAD: 未检测到语音活动")
+            return None
+            
+    except Exception as e:
+        print(f"WebRTC VAD处理失败: {e}")
+        return None
+
+def apply_silero_vad(audio, sr):
+    """使用Silero VAD进行语音活动检测"""
+    global silero_vad_model, silero_vad_utils
+    
+    try:
+        import torch
+        
+        # 检查torch是否可用
+        if not torch.cuda.is_available() and not torch.backends.mps.is_available():
+            # 如果没有GPU，使用CPU
+            device = torch.device('cpu')
+        else:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'mps')
+        
+        # 如果模型还未加载，尝试加载
+        if silero_vad_model is None or silero_vad_utils is None:
+            print("首次使用Silero VAD，正在加载模型...")
+            
+            # 尝试加载Silero VAD模型
+            try:
+                model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad',
+                                              model='silero_vad',
+                                              force_reload=False,
+                                              trust_repo=True)
+                silero_vad_model = model.to(device)
+                silero_vad_utils = utils
+                print("Silero VAD模型加载成功")
+            except Exception as hub_error:
+                print(f"无法从torch.hub加载Silero VAD模型: {hub_error}")
+                # 尝试本地加载或使用替代方法
+                try:
+                    # 尝试直接导入silero_vad
+                    import silero_vad
+                    model, utils = silero_vad.load_silero_vad()
+                    silero_vad_model = model
+                    silero_vad_utils = utils
+                    print("本地Silero VAD包加载成功")
+                except Exception as local_error:
+                    print(f"本地Silero VAD加载也失败: {local_error}")
+                    print("建议：")
+                    print("1. 检查网络连接")
+                    print("2. 安装本地silero-vad包: pip install silero-vad")
+                    print("3. 或者使用WebRTC VAD作为替代")
+                    return None
+        
+        # 使用缓存的模型和工具
+        model = silero_vad_model
+        utils = silero_vad_utils
+        
+        (get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks) = utils
+        
+        # 确保音频是torch tensor格式
+        if not isinstance(audio, torch.Tensor):
+            audio_tensor = torch.from_numpy(audio).float().to(device)
+        else:
+            audio_tensor = audio.to(device)
+        
+        # 获取语音时间戳
+        speech_timestamps = get_speech_timestamps(audio_tensor, model, sampling_rate=sr)
+        
+        if speech_timestamps:
+            # 收集语音片段
+            voiced_audio = collect_chunks(speech_timestamps, audio_tensor)
+            
+            # 转换回numpy数组
+            if isinstance(voiced_audio, torch.Tensor):
+                voiced_audio = voiced_audio.cpu().numpy()
+            
+            # 保存过滤后的音频
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=temp_dir) as tmpfile:
+                output_path = tmpfile.name
+            
+            import soundfile as sf
+            sf.write(output_path, voiced_audio, sr)
+            print(f"Silero VAD处理完成，检测到 {len(speech_timestamps)} 个语音片段")
+            return output_path
+        else:
+            print("Silero VAD: 未检测到语音活动")
+            return None
+            
+    except Exception as e:
+        print(f"Silero VAD处理失败: {e}")
+        print(f"错误详情: {traceback.format_exc()}")
+        return None
+
+# ============================== CT2 模型转换功能 ==============================
+def convert_model_to_ct2(model_path, output_dir, quantization="float16"):
+    """将模型转换为CT2格式"""
+    if not CT2_CONVERTER_AVAILABLE:
+        return False, "ct2-transformers-converter 未安装"
+    
+    try:
+        import ct2_transformers_converter
+        
+        # 确保输出目录存在
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 执行转换
+        ct2_transformers_converter.convert_model(
+            model_path,
+            output_dir,
+            quantization=quantization,
+            force=True
+        )
+        
+        return True, f"模型已成功转换为CT2格式并保存到: {output_dir}"
+        
+    except Exception as e:
+        return False, f"CT2转换失败: {str(e)}"
+
+# ============================== 多模型管理功能 ==============================
+class MultiModelManager:
+    """多模型管理器，支持同时加载和对比多个模型"""
+    
+    def __init__(self):
+        self.models = {}
+        self.model_types = {}
+    
+    def add_model(self, name, model_path, model_type="whisper", **kwargs):
+        """添加模型到管理器"""
+        try:
+            if model_type == "faster_whisper" and FASTER_WHISPER_AVAILABLE:
+                model = FasterWhisperModel(model_path, **kwargs)
+            elif model_type == "whisper":
+                model = load_model(model_path, kwargs.get('download_root'), kwargs.get('is_local_model', False))
+            else:
+                raise ValueError(f"不支持的模型类型: {model_type}")
+            
+            self.models[name] = model
+            self.model_types[name] = model_type
+            return True, f"模型 {name} 加载成功"
+            
+        except Exception as e:
+            return False, f"模型 {name} 加载失败: {str(e)}"
+    
+    def remove_model(self, name):
+        """从管理器中移除模型"""
+        if name in self.models:
+            del self.models[name]
+            del self.model_types[name]
+            return True, f"模型 {name} 已移除"
+        return False, f"模型 {name} 不存在"
+    
+    def transcribe_with_all_models(self, audio_path, task="transcribe", language=None):
+        """使用所有加载的模型进行转录对比"""
+        results = {}
+        
+        for name, model in self.models.items():
+            try:
+                model_type = self.model_types[name]
+                
+                if model_type == "faster_whisper":
+                    # Faster Whisper 模型
+                    segments, info = model.transcribe(audio_path, task=task, language=language)
+                    text = " ".join([segment.text for segment in segments])
+                    results[name] = {
+                        "text": text,
+                        "language": info.language if hasattr(info, 'language') else "unknown",
+                        "status": "success"
+                    }
+                else:
+                    # 标准 Whisper 模型
+                    if hasattr(model, 'pipe'):  # TransformersWhisperModel
+                        generate_kwargs = {"task": task}
+                        if language:
+                            generate_kwargs["language"] = language
+                        result = model.pipe(audio_path, return_timestamps=True, generate_kwargs=generate_kwargs)
+                        text = result.get("text", "")
+                        detected_lang = language if language else "auto"
+                    else:
+                        result = model.transcribe(audio_path, task=task, language=language)
+                        text = result["text"]
+                        detected_lang = result.get("language", "unknown")
+                    
+                    results[name] = {
+                        "text": text,
+                        "language": detected_lang,
+                        "status": "success"
+                    }
+                    
+            except Exception as e:
+                results[name] = {
+                    "text": "",
+                    "language": "unknown",
+                    "status": "error",
+                    "error": str(e)
+                }
+        
+        return results
+    
+    def get_model_list(self):
+        """获取已加载的模型列表"""
+        return {name: {"model_type": self.model_types.get(name, "unknown")} for name in self.models.keys()}
+
+# 全局多模型管理器实例
+multi_model_manager = MultiModelManager()
 
 # ============================== 步骤1: 数据准备功能 ==============================
 def data_prep_get_columns(input_file):
@@ -85,8 +411,8 @@ def check_disk_space(path, required_mb=100):
         print(f"无法检查磁盘空间: {str(e)}")
         return True  # 如果无法检查，假设空间足够
 
-def save_dataset(results, output_dir, enable_split, train_ratio):
-    """保存数据集到文件（增强错误处理）"""
+def save_dataset(results, output_dir, enable_split, train_ratio, enable_final_test, final_test_ratio):
+    """保存数据集到文件（增强错误处理，支持三个数据集划分）"""
     try:
         # 检查输出目录是否存在且可写
         if not os.path.exists(output_dir):
@@ -103,62 +429,132 @@ def save_dataset(results, output_dir, enable_split, train_ratio):
         if not results:
             return None, "警告：处理后的数据集为空，跳过文件生成！"
         
+        # 随机打乱数据（无论是否划分数据集都进行打乱）
+        random.shuffle(results)
+        
         # 文件保存逻辑
         if enable_split:
-            # 随机打乱数据
-            random.shuffle(results)
-            
-            # 计算划分点
             total_count = len(results)
-            train_count = int(total_count * train_ratio)
             
-            # 划分数据
-            train_data = results[:train_count]
-            test_data = results[train_count:]
-            
-            # 生成文件名（带时间戳避免覆盖）
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            train_file = os.path.join(output_dir, f"train_{timestamp}.jsonl")
-            test_file = os.path.join(output_dir, f"test_{timestamp}.jsonl")
-            info_file = os.path.join(output_dir, f"dataset_info_{timestamp}.txt")
-            
-            output_files = [train_file, test_file, info_file]
-            
-            # 保存训练集（分批写入）
-            try:
-                with open(train_file, 'w', encoding='utf-8') as f:
-                    for i in range(0, len(train_data), 10000):
-                        chunk = train_data[i:i+10000]
-                        for item in chunk:
-                            f.write(json.dumps(item, ensure_ascii=False) + '\n')
-                print(f"训练集保存成功: {train_file}")
-            except IOError as e:
-                return None, f"写入训练集失败: {str(e)}"
-            
-            # 保存测试集（分批写入）
-            try:
-                with open(test_file, 'w', encoding='utf-8') as f:
-                    for i in range(0, len(test_data), 10000):
-                        chunk = test_data[i:i+10000]
-                        for item in chunk:
-                            f.write(json.dumps(item, ensure_ascii=False) + '\n')
-                print(f"测试集保存成功: {test_file}")
-            except IOError as e:
-                return None, f"写入测试集失败: {str(e)}"
-            
-            # 创建数据集信息
-            try:
-                with open(info_file, 'w', encoding='utf-8') as f:
-                    f.write(f"数据集划分信息\n")
-                    f.write(f"生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                    f.write(f"总数据量: {total_count}\n")
-                    f.write(f"训练集: {len(train_data)} ({train_ratio*100:.1f}%)\n")
-                    f.write(f"测试集: {len(test_data)} ({(1-train_ratio)*100:.1f}%)\n")
-                    f.write(f"训练集文件: {train_file}\n")
-                    f.write(f"测试集文件: {test_file}\n")
-                print(f"数据集信息保存成功: {info_file}")
-            except IOError as e:
-                return None, f"写入数据集信息失败: {str(e)}"
+            if enable_final_test:
+                # 三个数据集划分：训练集、验证集、最终测试集
+                final_test_count = int(total_count * final_test_ratio)
+                remaining_count = total_count - final_test_count
+                train_count = int(remaining_count * train_ratio)
+                
+                # 划分数据
+                train_data = results[:train_count]
+                val_data = results[train_count:remaining_count]
+                final_test_data = results[remaining_count:]
+                
+                # 生成文件名（带时间戳避免覆盖）
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                train_file = os.path.join(output_dir, f"train_{timestamp}.jsonl")
+                val_file = os.path.join(output_dir, f"val_{timestamp}.jsonl")
+                final_test_file = os.path.join(output_dir, f"final_test_{timestamp}.jsonl")
+                info_file = os.path.join(output_dir, f"dataset_info_{timestamp}.txt")
+                
+                output_files = [train_file, val_file, final_test_file, info_file]
+                
+                # 保存训练集
+                try:
+                    with open(train_file, 'w', encoding='utf-8') as f:
+                        for i in range(0, len(train_data), 10000):
+                            chunk = train_data[i:i+10000]
+                            for item in chunk:
+                                f.write(json.dumps(item, ensure_ascii=False) + '\n')
+                    print(f"训练集保存成功: {train_file}")
+                except IOError as e:
+                    return None, f"写入训练集失败: {str(e)}"
+                
+                # 保存验证集
+                try:
+                    with open(val_file, 'w', encoding='utf-8') as f:
+                        for i in range(0, len(val_data), 10000):
+                            chunk = val_data[i:i+10000]
+                            for item in chunk:
+                                f.write(json.dumps(item, ensure_ascii=False) + '\n')
+                    print(f"验证集保存成功: {val_file}")
+                except IOError as e:
+                    return None, f"写入验证集失败: {str(e)}"
+                
+                # 保存最终测试集
+                try:
+                    with open(final_test_file, 'w', encoding='utf-8') as f:
+                        for i in range(0, len(final_test_data), 10000):
+                            chunk = final_test_data[i:i+10000]
+                            for item in chunk:
+                                f.write(json.dumps(item, ensure_ascii=False) + '\n')
+                    print(f"最终测试集保存成功: {final_test_file}")
+                except IOError as e:
+                    return None, f"写入最终测试集失败: {str(e)}"
+                
+                # 创建数据集信息
+                try:
+                    with open(info_file, 'w', encoding='utf-8') as f:
+                        f.write(f"数据集划分信息\n")
+                        f.write(f"生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                        f.write(f"总数据量: {total_count}\n")
+                        f.write(f"训练集: {len(train_data)} ({len(train_data)/total_count*100:.1f}%)\n")
+                        f.write(f"验证集: {len(val_data)} ({len(val_data)/total_count*100:.1f}%)\n")
+                        f.write(f"最终测试集: {len(final_test_data)} ({final_test_ratio*100:.1f}%)\n")
+                        f.write(f"训练集文件: {train_file}\n")
+                        f.write(f"验证集文件: {val_file}\n")
+                        f.write(f"最终测试集文件: {final_test_file}\n")
+                    print(f"数据集信息保存成功: {info_file}")
+                except IOError as e:
+                    return None, f"写入数据集信息失败: {str(e)}"
+            else:
+                # 两个数据集划分：训练集、测试集
+                train_count = int(total_count * train_ratio)
+                
+                # 划分数据
+                train_data = results[:train_count]
+                test_data = results[train_count:]
+                
+                # 生成文件名（带时间戳避免覆盖）
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                train_file = os.path.join(output_dir, f"train_{timestamp}.jsonl")
+                test_file = os.path.join(output_dir, f"test_{timestamp}.jsonl")
+                info_file = os.path.join(output_dir, f"dataset_info_{timestamp}.txt")
+                
+                output_files = [train_file, test_file, info_file]
+                
+                # 保存训练集（分批写入）
+                try:
+                    with open(train_file, 'w', encoding='utf-8') as f:
+                        for i in range(0, len(train_data), 10000):
+                            chunk = train_data[i:i+10000]
+                            for item in chunk:
+                                f.write(json.dumps(item, ensure_ascii=False) + '\n')
+                    print(f"训练集保存成功: {train_file}")
+                except IOError as e:
+                    return None, f"写入训练集失败: {str(e)}"
+                
+                # 保存测试集（分批写入）
+                try:
+                    with open(test_file, 'w', encoding='utf-8') as f:
+                        for i in range(0, len(test_data), 10000):
+                            chunk = test_data[i:i+10000]
+                            for item in chunk:
+                                f.write(json.dumps(item, ensure_ascii=False) + '\n')
+                    print(f"测试集保存成功: {test_file}")
+                except IOError as e:
+                    return None, f"写入测试集失败: {str(e)}"
+                
+                # 创建数据集信息
+                try:
+                    with open(info_file, 'w', encoding='utf-8') as f:
+                        f.write(f"数据集划分信息\n")
+                        f.write(f"生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                        f.write(f"总数据量: {total_count}\n")
+                        f.write(f"训练集: {len(train_data)} ({train_ratio*100:.1f}%)\n")
+                        f.write(f"测试集: {len(test_data)} ({(1-train_ratio)*100:.1f}%)\n")
+                        f.write(f"训练集文件: {train_file}\n")
+                        f.write(f"测试集文件: {test_file}\n")
+                    print(f"数据集信息保存成功: {info_file}")
+                except IOError as e:
+                    return None, f"写入数据集信息失败: {str(e)}"
             
             return output_files, f"数据集已生成: {len(output_files)}个文件"
         else:
@@ -184,7 +580,8 @@ def save_dataset(results, output_dir, enable_split, train_ratio):
 
 def data_prep_generate_json(input_file, audio_col, text_col, language_col, 
                  start_col, end_col, segment_text_col, output_dir, include_sentences, 
-                 include_duration, train_ratio, enable_split, add_punctuation, auto_calc_duration):
+                 include_duration, train_ratio, enable_split, add_punctuation, auto_calc_duration, 
+                 enable_final_test, final_test_ratio):
     """生成JSON文件的主函数（修复文件生成问题）"""
     try:
         # 确保输出目录存在
@@ -328,7 +725,9 @@ def data_prep_generate_json(input_file, audio_col, text_col, language_col,
             results, 
             output_dir, 
             enable_split, 
-            train_ratio
+            train_ratio,
+            enable_final_test,
+            final_test_ratio
         )
         
         if saved_files:
@@ -402,17 +801,42 @@ def data_prep_update_preview(input_file):
         return pd.DataFrame(), ["不选择"]
 
 # ============================== 步骤2: 模型训练功能 ==============================
-def load_model(model_name_or_path, download_root=None, is_local_model=False):
-    """加载模型，支持预定义模型名称或本地路径"""
+def load_model(model_name_or_path, download_root=None, is_local_model=False, model_type="whisper", device="auto", compute_type="float16"):
+    """加载模型，支持预定义模型名称或本地路径，支持Faster Whisper"""
     # 如果未指定下载目录，使用当前工作目录
     if download_root is None or download_root.strip() == "":
         download_root = os.getcwd()  # 默认下载到当前目录
     
     # 检查模型是否已加载
-    cache_key = f"{model_name_or_path}_{download_root}_{is_local_model}"
+    cache_key = f"{model_name_or_path}_{download_root}_{is_local_model}_{model_type}_{device}_{compute_type}"
     if cache_key in model_cache:
         print(f"使用缓存的模型: {cache_key}")
         return model_cache[cache_key]
+    
+    # 处理Faster Whisper模型
+    if model_type == "faster_whisper" and FASTER_WHISPER_AVAILABLE:
+        try:
+            # 设置设备
+            if device == "auto":
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            
+            print(f"使用Faster Whisper加载模型: {model_name_or_path}")
+            model = FasterWhisperModel(
+                model_name_or_path,
+                device=device,
+                compute_type=compute_type,
+                download_root=download_root if not is_local_model else None
+            )
+            
+            model_cache[cache_key] = model
+            return model
+            
+        except Exception as e:
+            print(f"Faster Whisper加载失败: {e}")
+            raise gr.Error(f"Faster Whisper模型加载失败: {str(e)}")
+    
+    elif model_type == "faster_whisper" and not FASTER_WHISPER_AVAILABLE:
+        raise gr.Error("Faster Whisper未安装，请运行: pip install faster-whisper")
     
     try:
         if is_local_model:
@@ -1000,8 +1424,67 @@ def merge_models(lora_model, output_dir, local_files_only):
         return f"模型合并失败: {str(e)}"
 
 # ============================== 步骤4: 模型使用功能 ==============================
-def transcribe_audio(model_name, file_path, task, language, custom_model_path, download_root, model_type):
-    """执行语音识别或翻译"""
+def transcribe_audio(model_name, file_path, task, language, custom_model_path, download_root, model_type, 
+                     enable_vad=False, vad_method="silero", vad_aggressiveness=3, 
+                     enable_multi_model=False, whisper_model_type="whisper", device="auto", compute_type="float16"):
+    """执行语音识别或翻译，支持VAD过滤和多模型对比"""
+    
+    # 应用VAD过滤（如果启用）
+    processed_audio_path = file_path
+    if enable_vad:
+        try:
+            filtered_path = apply_vad_filter(file_path, vad_method, vad_aggressiveness)
+            if filtered_path and filtered_path != file_path:
+                processed_audio_path = filtered_path
+                print(f"VAD过滤完成: {vad_method}")
+            else:
+                print("VAD过滤未生效，使用原始音频")
+        except Exception as e:
+            print(f"VAD过滤失败: {e}，使用原始音频")
+    
+    # 多模型对比模式
+    if enable_multi_model:
+        try:
+            # 获取已加载的模型列表
+            model_list = multi_model_manager.get_model_list()
+            if not model_list:
+                return "未加载任何模型进行对比", "", ""
+            
+            # 设置语言参数
+            lang = None if language == "自动检测" else language
+            
+            # 使用所有模型进行转录
+            results = multi_model_manager.transcribe_with_all_models(
+                processed_audio_path, task, lang
+            )
+            
+            # 格式化对比结果
+            formatted_results = []
+            detected_languages = []
+            
+            for model_name, result in results.items():
+                if result["status"] == "success":
+                    formatted_results.append(f"**{model_name}:**\n{result['text']}\n")
+                    detected_languages.append(result["language"])
+                else:
+                    formatted_results.append(f"**{model_name}:** 错误 - {result.get('error', '未知错误')}\n")
+            
+            combined_text = "\n".join(formatted_results)
+            
+            # 返回最常见的检测语言
+            if detected_languages:
+                most_common_lang = max(set(detected_languages), key=detected_languages.count)
+                detected_lang_name = LANGUAGES.get(most_common_lang, most_common_lang)
+            else:
+                most_common_lang = "unknown"
+                detected_lang_name = "未知"
+            
+            return combined_text, detected_lang_name, most_common_lang
+            
+        except Exception as e:
+            return f"多模型对比失败: {str(e)}", "", ""
+    
+    # 单模型模式
     # 根据模型类型选择加载方式
     if model_type == "本地模型":
         if not custom_model_path or not os.path.exists(custom_model_path):
@@ -1013,22 +1496,37 @@ def transcribe_audio(model_name, file_path, task, language, custom_model_path, d
         is_local = False
     
     try:
-        model = load_model(model_path, download_root, is_local)
+        model = load_model(model_path, download_root, is_local, whisper_model_type, device, compute_type)
     except Exception as e:
         return str(e), "", ""
     
     # 设置语言参数
     lang = None if language == "自动检测" else language
     
-    # 检查模型类型并相应处理
-    if hasattr(model, 'pipe'):  # TransformersWhisperModel
-        # 使用transformers pipeline
-        generate_kwargs = {"task": task}
-        if lang:
-            generate_kwargs["language"] = lang
-        
-        try:
-            result = model.pipe(file_path, return_timestamps=True, generate_kwargs=generate_kwargs)
+    # 根据模型类型处理
+    try:
+        if whisper_model_type == "faster_whisper":
+            # Faster Whisper 模型
+            segments, info = model.transcribe(processed_audio_path, task=task, language=lang)
+            
+            # 格式化结果
+            formatted_segments = []
+            for segment in segments:
+                formatted_segments.append(f"[{segment.start:.2f}s - {segment.end:.2f}s] {segment.text}")
+            
+            text = "\n".join(formatted_segments)
+            detected_lang = info.language if hasattr(info, 'language') else "unknown"
+            detected_lang_name = LANGUAGES.get(detected_lang, detected_lang)
+            
+            return text, detected_lang_name, detected_lang
+            
+        elif hasattr(model, 'pipe'):  # TransformersWhisperModel
+            # 使用transformers pipeline
+            generate_kwargs = {"task": task}
+            if lang:
+                generate_kwargs["language"] = lang
+            
+            result = model.pipe(processed_audio_path, return_timestamps=True, generate_kwargs=generate_kwargs)
             
             # 格式化结果
             if "chunks" in result:
@@ -1055,13 +1553,11 @@ def transcribe_audio(model_name, file_path, task, language, custom_model_path, d
             detected_lang_name = LANGUAGES.get(detected_lang, detected_lang) if detected_lang != "auto" else "自动检测"
             
             return text, detected_lang_name, detected_lang
-        except Exception as e:
-            return f"transformers模型推理失败: {str(e)}", "", ""
-    else:
-        # 使用标准whisper模型
-        try:
+            
+        else:
+            # 使用标准whisper模型
             result = model.transcribe(
-                file_path,
+                processed_audio_path,
                 task=task,
                 language=lang
             )
@@ -1071,8 +1567,17 @@ def transcribe_audio(model_name, file_path, task, language, custom_model_path, d
             detected_lang_name = LANGUAGES.get(detected_lang, detected_lang)
             
             return result["text"], detected_lang_name, detected_lang
-        except Exception as e:
-            return f"whisper模型推理失败: {str(e)}", "", ""
+            
+    except Exception as e:
+        return f"模型推理失败: {str(e)}", "", ""
+    
+    finally:
+        # 清理临时VAD过滤文件
+        if enable_vad and processed_audio_path != file_path:
+            try:
+                os.unlink(processed_audio_path)
+            except:
+                pass
 
 def process_file(file, model_name, task, language, custom_model_path, download_root, model_type):
     """处理上传的文件"""
@@ -1294,19 +1799,99 @@ with gr.Blocks(theme=gr.themes.Ocean(), title="Whisper 训练工具套件") as d
                         value=True
                     )
                     
-                gr.Markdown("### 数据集划分")
-                with gr.Row():
-                    enable_split = gr.Checkbox(
-                        label="启用数据集划分",
-                        value=False
-                    )
+                gr.Markdown("### 📊 数据集划分配置")
+                gr.Markdown("💡 **注意**: 数据将自动随机打乱后生成JSONL文件，确保训练数据的随机性")
+                
+                # 数据集划分模式选择
+                dataset_split_mode = gr.Radio(
+                    label="📋 数据集划分模式",
+                    choices=[
+                        "不划分 - 生成单个完整数据集",
+                        "二分割 - 训练集 + 验证集", 
+                        "三分割 - 训练集 + 验证集 + 最终测试集"
+                    ],
+                    value="不划分 - 生成单个完整数据集",
+                    info="选择数据集的划分方式"
+                )
+                
+                # 二分割配置区域
+                with gr.Group(visible=False) as two_split_config:
+                    gr.Markdown("#### 🔄 二分割配置")
+                    gr.Markdown("📈 **说明**: 数据将被划分为训练集和验证集两部分")
                     train_ratio = gr.Slider(
                         label="训练集比例",
-                        minimum=0.1,
-                        maximum=0.9,
+                        minimum=0.5,
+                        maximum=0.95,
                         value=0.8,
-                        step=0.05
+                        step=0.05,
+                        info="训练集占总数据的比例，剩余部分为验证集"
                     )
+                    with gr.Row():
+                        gr.Markdown("**示例**: 1000条数据，训练集80% → 训练集800条，验证集200条")
+                
+                # 三分割配置区域
+                with gr.Group(visible=False) as three_split_config:
+                    gr.Markdown("#### 🎯 三分割配置")
+                    gr.Markdown("📊 **说明**: 数据将被划分为训练集、验证集和最终测试集三部分")
+                    
+                    with gr.Row():
+                        final_test_ratio = gr.Slider(
+                            label="最终测试集比例",
+                            minimum=0.05,
+                            maximum=0.3,
+                            value=0.1,
+                            step=0.05,
+                            info="从总数据中划分的比例，用于最终模型评估"
+                        )
+                        train_ratio_three = gr.Slider(
+                            label="训练集比例（剩余数据中）",
+                            minimum=0.5,
+                            maximum=0.95,
+                            value=0.8,
+                            step=0.05,
+                            info="从剩余数据中划分训练集的比例"
+                        )
+                    
+                    gr.Markdown("**划分流程**:")
+                    gr.Markdown("1️⃣ 首先从总数据中划分出最终测试集")
+                    gr.Markdown("2️⃣ 剩余数据按训练集比例划分为训练集和验证集")
+                    gr.Markdown("**示例**: 1000条数据，最终测试集10%，训练集80% → 最终测试集100条，训练集720条，验证集180条")
+                
+                # 隐藏的兼容性变量（保持原有接口）
+                enable_split = gr.State(False)
+                enable_final_test = gr.State(False)
+                
+                # 添加模式切换的交互逻辑
+                def update_split_interface(mode):
+                    """根据选择的模式更新界面显示"""
+                    if mode == "不划分 - 生成单个完整数据集":
+                        return (
+                            gr.Group(visible=False),  # two_split_config
+                            gr.Group(visible=False),  # three_split_config
+                            False,  # enable_split
+                            False   # enable_final_test
+                        )
+                    elif mode == "二分割 - 训练集 + 验证集":
+                        return (
+                            gr.Group(visible=True),   # two_split_config
+                            gr.Group(visible=False),  # three_split_config
+                            True,   # enable_split
+                            False   # enable_final_test
+                        )
+                    else:  # 三分割模式
+                        return (
+                            gr.Group(visible=False),  # two_split_config
+                            gr.Group(visible=True),   # three_split_config
+                            True,   # enable_split
+                            True    # enable_final_test
+                        )
+                
+                # 绑定模式切换事件
+                dataset_split_mode.change(
+                    fn=update_split_interface,
+                    inputs=[dataset_split_mode],
+                    outputs=[two_split_config, three_split_config, enable_split, enable_final_test]
+                )
                 
                 generate_btn = gr.Button("生成数据集", variant="primary", size="lg")
 
@@ -1351,9 +1936,39 @@ with gr.Blocks(theme=gr.themes.Ocean(), title="Whisper 训练工具套件") as d
             ]
         )
         
+        # 包装函数，根据模式选择正确的参数
+        def generate_with_mode_selection(
+            file_input, audio_col, text_col, language_col, start_col, end_col, 
+            segment_text_col, output_dir, include_sentences, include_duration, 
+            add_punctuation, auto_calc_duration, dataset_split_mode, 
+            train_ratio_two, train_ratio_three, final_test_ratio, 
+            enable_split_state, enable_final_test_state
+        ):
+            """根据选择的模式调用数据生成函数"""
+            # 根据模式确定参数
+            if dataset_split_mode == "不划分 - 生成单个完整数据集":
+                actual_enable_split = False
+                actual_enable_final_test = False
+                actual_train_ratio = 0.8  # 默认值，不会被使用
+            elif dataset_split_mode == "二分割 - 训练集 + 验证集":
+                actual_enable_split = True
+                actual_enable_final_test = False
+                actual_train_ratio = train_ratio_two
+            else:  # 三分割模式
+                actual_enable_split = True
+                actual_enable_final_test = True
+                actual_train_ratio = train_ratio_three
+            
+            return data_prep_generate_json(
+                file_input, audio_col, text_col, language_col, start_col, end_col,
+                segment_text_col, output_dir, include_sentences, include_duration,
+                actual_train_ratio, actual_enable_split, add_punctuation, auto_calc_duration,
+                actual_enable_final_test, final_test_ratio
+            )
+        
         # 生成JSON文件
         generate_btn.click(
-            fn=data_prep_generate_json,
+            fn=generate_with_mode_selection,
             inputs=[
                 file_input,
                 audio_col,
@@ -1365,10 +1980,14 @@ with gr.Blocks(theme=gr.themes.Ocean(), title="Whisper 训练工具套件") as d
                 output_dir,
                 include_sentences,
                 include_duration,
-                train_ratio,
-                enable_split,
                 add_punctuation,
-                auto_calc_duration
+                auto_calc_duration,
+                dataset_split_mode,
+                train_ratio,
+                train_ratio_three,
+                final_test_ratio,
+                enable_split,
+                enable_final_test
             ],
             outputs=output_result
         )
@@ -1557,14 +2176,40 @@ with gr.Blocks(theme=gr.themes.Ocean(), title="Whisper 训练工具套件") as d
     # ======================= 步骤4: 模型使用 =======================
     with gr.Tab("步骤4: 模型使用", id="model_usage"):
         gr.Markdown("### 🎧 语音识别与翻译")
-        gr.Markdown("使用Whisper模型进行语音识别或翻译")
+        gr.Markdown("使用Whisper模型进行语音识别或翻译，支持Faster Whisper、VAD过滤、多模型对比等高级功能")
         
         with gr.Row():
             with gr.Column(scale=1):
-                gr.Markdown("#### 模型设置")
+                gr.Markdown("#### 🔧 模型配置")
                 with gr.Group():
+                    # 模型引擎选择
+                    whisper_model_type = gr.Radio(
+                        label="Whisper引擎类型",
+                        choices=["whisper", "faster_whisper", "transformers"],
+                        value="whisper",
+                        info="whisper: 标准OpenAI Whisper | faster_whisper: 优化版本，速度更快 | transformers: HuggingFace版本"
+                    )
+                    
+                    # 设备和计算类型设置（仅Faster Whisper可见）
+                    with gr.Group(visible=False) as faster_whisper_settings:
+                        gr.Markdown("**Faster Whisper设置**")
+                        with gr.Row():
+                            device_choice = gr.Dropdown(
+                                label="设备选择",
+                                choices=["auto", "cuda", "cpu"],
+                                value="auto",
+                                info="auto: 自动检测 | cuda: GPU加速 | cpu: CPU推理"
+                            )
+                            compute_type = gr.Dropdown(
+                                label="计算精度",
+                                choices=["float16", "float32", "int8"],
+                                value="float16",
+                                info="float16: 半精度，速度快 | float32: 全精度 | int8: 量化，内存占用小"
+                            )
+                    
+                    # 模型类型和路径
                     model_type = gr.Radio(
-                        label="模型类型",
+                        label="模型来源",
                         choices=["在线模型", "本地模型"],
                         value="在线模型"
                     )
@@ -1586,37 +2231,129 @@ with gr.Blocks(theme=gr.themes.Ocean(), title="Whisper 训练工具套件") as d
                         visible=True
                     )
                 
-                gr.Markdown("#### 任务设置")
-                task_choice = gr.Radio(
-                    label="任务类型",
-                    choices=["transcribe", "translate"],
-                    value="transcribe"
-                )
+                gr.Markdown("#### 🎯 任务设置")
+                with gr.Group():
+                    task_choice = gr.Radio(
+                        label="任务类型",
+                        choices=["transcribe", "translate"],
+                        value="transcribe"
+                    )
+                    
+                    language_choice = gr.Dropdown(
+                        label="语言选择 (仅用于语音识别)",
+                        choices=language_options,
+                        value="自动检测",
+                        visible=True
+                    )
                 
-                language_choice = gr.Dropdown(
-                    label="语言选择 (仅用于语音识别)",
-                    choices=language_options,
-                    value="自动检测",
-                    visible=True
-                )
+                gr.Markdown("#### 🔊 音频输入")
+                with gr.Group():
+                    # 音频输入方式选择
+                    audio_input_mode = gr.Radio(
+                        label="音频输入方式",
+                        choices=["文件上传", "目录批量", "语音录制"],
+                        value="文件上传",
+                        info="文件上传: 单个文件 | 目录批量: 批量处理文件夹 | 语音录制: 实时录音"
+                    )
+                    
+                    # 单文件上传
+                    file_input = gr.File(
+                        label="上传音频/视频文件", 
+                        file_types=["audio", "video"],
+                        visible=True
+                    )
+                    
+                    # 目录批量上传
+                    directory_input = gr.Textbox(
+                        label="音频文件路径或目录路径",
+                        placeholder="例如: /path/to/audio/files 或 /path/to/audio.wav",
+                        visible=False,
+                        info="支持目录路径或直接音频文件路径 | 格式: .wav, .mp3, .m4a, .flac, .ogg"
+                    )
+                    
+                    # 语音录制
+                    audio_recorder = gr.Audio(
+                        label="语音录制",
+                        sources=["microphone"],
+                        type="filepath",
+                        visible=False
+                    )
                 
-                file_input = gr.File(
-                    label="上传音频/视频文件", 
-                    file_types=["audio", "video"]
-                )
-                submit_btn = gr.Button("开始转录", variant="primary")
+                gr.Markdown("#### ⚙️ 高级设置")
+                with gr.Group():
+                    # VAD设置
+                    enable_vad = gr.Checkbox(
+                        label="启用VAD语音活动检测",
+                        value=False,
+                        info="过滤静音片段，提高识别质量"
+                    )
+                    
+                    with gr.Row(visible=False) as vad_settings:
+                        vad_method = gr.Dropdown(
+                            label="VAD方法",
+                            choices=["silero", "webrtc"],
+                            value="silero",
+                            info="silero: 深度学习方法 | webrtc: 传统信号处理"
+                        )
+                        vad_aggressiveness = gr.Slider(
+                            label="VAD敏感度",
+                            minimum=0,
+                            maximum=3,
+                            value=3,
+                            step=1,
+                            info="0: 最不敏感 | 3: 最敏感"
+                        )
+                    
+                    # CT2模型转换（仅本地模型可见）
+                with gr.Group(visible=False) as ct2_conversion_group:
+                    gr.Markdown("**CT2模型转换**")
+                    with gr.Row():
+                        convert_to_ct2 = gr.Button(
+                            "转换为CT2格式",
+                            variant="secondary",
+                            size="sm"
+                        )
+                        ct2_output_dir = gr.Textbox(
+                            label="CT2输出目录",
+                            placeholder="转换后的CT2模型保存路径",
+                            scale=2
+                        )
+                
+                with gr.Row():
+                    submit_btn = gr.Button("🚀 开始转录", variant="primary", scale=2)
+                    clear_btn = gr.Button("🗑️ 清空结果", variant="secondary", scale=1)
             
             with gr.Column(scale=1):
-                gr.Markdown("#### 识别结果")
+                gr.Markdown("#### 📝 识别结果")
                 output_text = gr.Textbox(
                     label="识别/翻译结果", 
-                    lines=8, 
-                    interactive=True
+                    lines=12, 
+                    interactive=True,
+                    placeholder="转录结果将在这里显示..."
                 )
-                detected_lang = gr.Textbox(
-                    label="检测到的语言", 
-                    interactive=False
+                
+                with gr.Row():
+                    detected_lang = gr.Textbox(
+                        label="检测到的语言", 
+                        interactive=False,
+                        scale=1
+                    )
+                    processing_status = gr.Textbox(
+                        label="处理状态",
+                        interactive=False,
+                        scale=1
+                    )
+                
+                # 模型信息显示
+                gr.Markdown("#### ℹ️ 模型信息")
+                model_info_display = gr.Textbox(
+                    label="当前模型信息",
+                    lines=2,
+                    interactive=False,
+                    placeholder="选择模型后将显示相关信息"
                 )
+                
+                # 音频预览和文件信息
                 audio_preview = gr.Audio(
                     label="音频预览", 
                     interactive=False, 
@@ -1630,18 +2367,170 @@ with gr.Blocks(theme=gr.themes.Ocean(), title="Whisper 训练工具套件") as d
                     interactive=False
                 )
                 
-                gr.Markdown("#### 保存结果")
-                dataset_output_dir = gr.Textbox(
-                    label="数据集输出目录",
-                    value="whisper_dataset"
-                )
-                save_btn = gr.Button("保存当前转录结果", variant="secondary")
-                save_result = gr.Textbox(
-                    label="保存状态", 
-                    interactive=False
-                )
+                gr.Markdown("#### 💾 保存结果")
+                with gr.Group():
+                    dataset_output_dir = gr.Textbox(
+                        label="数据集输出目录",
+                        value="whisper_dataset"
+                    )
+                    with gr.Row():
+                        save_btn = gr.Button(
+                            "💾 保存当前结果", 
+                            variant="secondary",
+                            scale=1
+                        )
+                        export_btn = gr.Button(
+                            "📤 导出所有结果",
+                            variant="secondary",
+                            scale=1
+                        )
+                    save_result = gr.Textbox(
+                        label="保存状态", 
+                        interactive=False
+                    )
         
-        # 事件处理
+        # ======================= 事件处理函数 =======================
+        
+        # 音频输入方式切换
+        def update_audio_input_interface(mode):
+            """根据音频输入方式更新界面"""
+            if mode == "文件上传":
+                return gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)
+            elif mode == "目录批量":
+                return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
+            elif mode == "语音录制":
+                return gr.update(visible=False), gr.update(visible=False), gr.update(visible=True)
+            return gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)
+        
+        # VAD设置显示/隐藏
+        def update_vad_settings(enable_vad):
+            """根据VAD启用状态更新设置界面"""
+            return gr.update(visible=enable_vad)
+        
+        # 更新引擎设置界面
+        def update_engine_settings(engine_type, model_source):
+            """根据引擎类型和模型来源更新设置界面"""
+            # Faster Whisper设置可见性
+            faster_visible = (engine_type == "Faster Whisper")
+            # CT2转换功能可见性（仅本地模型且非Faster Whisper时可见）
+            ct2_visible = (model_source == "本地模型" and engine_type != "Faster Whisper")
+            
+            return gr.update(visible=faster_visible), gr.update(visible=ct2_visible)
+        
+        # 更新模型信息显示
+        def update_model_info(engine_type, model_source, model_name):
+            """更新模型信息显示"""
+            info_lines = []
+            info_lines.append(f"引擎类型: {engine_type}")
+            info_lines.append(f"模型来源: {model_source}")
+            if model_name:
+                info_lines.append(f"模型名称: {model_name}")
+            return "\n".join(info_lines)
+        
+        # 简化的处理函数（移除多模型管理功能）
+        
+        # CT2模型转换
+        def convert_model_to_ct2_handler(model_path, output_dir, model_type):
+            """处理CT2模型转换"""
+            if not CT2_CONVERTER_AVAILABLE:
+                return "CT2转换器不可用，请安装: pip install ct2-transformers-converter"
+            
+            if model_type == "本地模型":
+                if not model_path or not os.path.exists(model_path):
+                    return "请提供有效的本地模型路径"
+                source_path = model_path
+            else:
+                return "CT2转换仅支持本地模型"
+            
+            if not output_dir.strip():
+                return "请指定CT2输出目录"
+            
+            try:
+                result = convert_model_to_ct2(source_path, output_dir.strip())
+                return result
+            except Exception as e:
+                return f"CT2转换失败: {str(e)}"
+        
+        # 处理音频文件（支持新功能）
+        def process_audio_advanced(audio_input_mode, file_input, directory_input, audio_recorder,
+                                 model_choice, custom_model_path, model_type, whisper_model_type,
+                                 task_choice, language_choice, download_root_input,
+                                 enable_vad, vad_method, vad_aggressiveness,
+                                 device_choice, compute_type):
+            """高级音频处理函数，支持多种输入方式和新功能"""
+            
+            # 确定音频文件路径
+            audio_path = None
+            if audio_input_mode == "文件上传" and file_input:
+                audio_path = file_input.name if hasattr(file_input, 'name') else file_input
+            elif audio_input_mode == "语音录制" and audio_recorder:
+                audio_path = audio_recorder
+            elif audio_input_mode == "目录批量" and directory_input.strip():
+                # 目录批量处理 - 支持目录路径和直接音频文件路径
+                input_path = directory_input.strip()
+                
+                # 检查输入是文件还是目录
+                if os.path.isfile(input_path):
+                    # 直接是音频文件路径
+                    audio_extensions = ['.wav', '.mp3', '.m4a', '.flac', '.ogg']
+                    if any(input_path.lower().endswith(ext) for ext in audio_extensions):
+                        audio_path = input_path
+                    else:
+                        return "不支持的音频文件格式", "", "格式错误", ""
+                elif os.path.isdir(input_path):
+                    # 是目录路径，查找其中的音频文件
+                    import glob
+                    audio_extensions = ['*.wav', '*.mp3', '*.m4a', '*.flac', '*.ogg']
+                    audio_files = []
+                    for ext in audio_extensions:
+                        audio_files.extend(glob.glob(os.path.join(input_path, ext)))
+                    
+                    if audio_files:
+                        audio_path = audio_files[0]  # 处理第一个文件
+                    else:
+                        return "目录中未找到支持的音频文件", "", "未找到音频文件", ""
+                else:
+                    return "输入的路径不存在或无法访问", "", "路径错误", ""
+            
+            if not audio_path:
+                return "请提供音频输入", "", "无音频输入", ""
+            
+            try:
+                # 调用增强的转录函数
+                result_text, detected_language, lang_code = transcribe_audio(
+                    model_name=model_choice,
+                    file_path=audio_path,
+                    task=task_choice,
+                    language=language_choice,
+                    custom_model_path=custom_model_path,
+                    download_root=download_root_input,
+                    model_type=model_type,
+                    enable_vad=enable_vad,
+                    vad_method=vad_method,
+                    vad_aggressiveness=int(vad_aggressiveness),
+                    enable_multi_model=False,
+                    whisper_model_type=whisper_model_type,
+                    device=device_choice,
+                    compute_type=compute_type
+                )
+                
+                status = "处理完成"
+                if enable_vad:
+                    status += f" (VAD: {vad_method})"
+                
+                return result_text, detected_language, status, audio_path
+                
+            except Exception as e:
+                return f"处理失败: {str(e)}", "", "处理失败", ""
+        
+        # 清空结果
+        def clear_results():
+            """清空所有结果"""
+            return "", "", "已清空", ""
+        
+        # ======================= 事件绑定 =======================
+        
+        # 基础事件
         task_choice.change(
             fn=update_language_visibility,
             inputs=task_choice,
@@ -1654,17 +2543,67 @@ with gr.Blocks(theme=gr.themes.Ocean(), title="Whisper 训练工具套件") as d
             outputs=[model_choice, custom_model_path, download_root_input]
         )
         
-        def process_and_update_audio(file, model_name, task, language, custom_model_path, download_root, model_type):
-            """处理文件并同时更新音频预览和文件路径"""
-            text, detected_lang, lang_code, file_path = process_file(file, model_name, task, language, custom_model_path, download_root, model_type)
-            return text, detected_lang, lang_code, file_path, file_path  # 最后一个用于audio_preview
-        
-        submit_btn.click(
-            fn=process_and_update_audio,
-            inputs=[file_input, model_choice, task_choice, language_choice, custom_model_path, download_root_input, model_type],
-            outputs=[output_text, detected_lang, gr.Textbox(visible=False), audio_file_path, audio_preview]
+        # 新增事件
+        audio_input_mode.change(
+            fn=update_audio_input_interface,
+            inputs=audio_input_mode,
+            outputs=[file_input, directory_input, audio_recorder]
         )
         
+        enable_vad.change(
+            fn=update_vad_settings,
+            inputs=enable_vad,
+            outputs=vad_settings
+        )
+        
+        # 引擎设置联动事件
+        whisper_model_type.change(
+            fn=update_engine_settings,
+            inputs=[whisper_model_type, model_type],
+            outputs=[faster_whisper_settings, ct2_conversion_group]
+        )
+        
+        model_type.change(
+            fn=update_engine_settings,
+            inputs=[whisper_model_type, model_type],
+            outputs=[faster_whisper_settings, ct2_conversion_group]
+        )
+        
+        # 模型信息更新事件
+        for component in [whisper_model_type, model_type, model_choice]:
+            component.change(
+                fn=update_model_info,
+                inputs=[whisper_model_type, model_type, model_choice],
+                outputs=model_info_display
+            )
+        
+        # CT2转换事件
+        convert_to_ct2.click(
+            fn=convert_model_to_ct2_handler,
+            inputs=[custom_model_path, ct2_output_dir, model_type],
+            outputs=save_result
+        )
+        
+        # 主要处理事件
+        submit_btn.click(
+            fn=process_audio_advanced,
+            inputs=[
+                audio_input_mode, file_input, directory_input, audio_recorder,
+                model_choice, custom_model_path, model_type, whisper_model_type,
+                task_choice, language_choice, download_root_input,
+                enable_vad, vad_method, vad_aggressiveness,
+                device_choice, compute_type
+            ],
+            outputs=[output_text, detected_lang, processing_status, audio_file_path]
+        )
+        
+        # 清空结果事件
+        clear_btn.click(
+            fn=clear_results,
+            outputs=[output_text, detected_lang, processing_status, audio_file_path]
+        )
+        
+        # 保存结果事件
         save_btn.click(
             fn=save_dataset_entry,
             inputs=[output_text, audio_file_path, dataset_output_dir],
